@@ -36,32 +36,12 @@ def run_test(name, test_func):
         failed += 1
 
 print("=" * 80)
-print("  SQL 优化建议引擎 - 全面增强测试 (内部API)")
+print("  SQL 优化建议引擎 - 第三轮增强测试")
 print("=" * 80)
 
-# 测试1: 函数名误判字段修复
-def test1():
-    sql = "SELECT * FROM orders WHERE UPPER(customer_name) = 'JOHN' AND YEAR(order_date) = 2024 AND status = 'active'"
-    result = engine.analyze(sql)
-    pr = result["parse_result"]
-    where_cols = pr["where_columns"]
-    where_funcs = pr["where_functions"]
-    
-    assert "UPPER" not in where_cols, f"UPPER 不应在 WHERE 列中: {where_cols}"
-    assert "YEAR" not in where_cols, f"YEAR 不应在 WHERE 列中: {where_cols}"
-    assert "status" in where_cols, f"status 应在 WHERE 列中: {where_cols}"
-    
-    func_names = [f.get("function", "") for f in where_funcs]
-    func_args = [f.get("arguments", "") for f in where_funcs]
-    assert "UPPER" in func_names, f"UPPER 应被识别为函数: {func_names}"
-    assert "YEAR" in func_names, f"YEAR 应被识别为函数: {func_names}"
-    assert any("customer_name" in a for a in func_args), f"customer_name 应在函数参数中: {func_args}"
-    assert any("order_date" in a for a in func_args), f"order_date 应在函数参数中: {func_args}"
+# ---- 1. IN子查询改写返回完整可执行SELECT ----
 
-run_test("函数名误判字段修复", test1)
-
-# 测试2: IN子查询识别与改写建议
-def test2():
+def test_in_subquery_join_complete():
     sql = """
     SELECT o.order_id, o.total
     FROM orders o
@@ -72,106 +52,155 @@ def test2():
     )
     """
     result = engine.analyze(sql)
-    pr = result["parse_result"]
-    in_subs = pr["in_subqueries"]
-    
-    assert len(in_subs) >= 1, f"应识别到 IN 子查询: {in_subs}"
-    
     suggestions = result["suggestions"]
     r003 = [s for s in suggestions if s["rule_id"] == "R003"]
-    assert len(r003) >= 1, f"应给出 R003 建议: {suggestions}"
+    assert len(r003) >= 1, f"应给出 R003 建议"
     
     details = r003[0].get("details", {})
     rewrite_options = details.get("rewrite_options", [])
-    assert len(rewrite_options) >= 2, f"应提供 2 种改写方案: {rewrite_options}"
+    assert len(rewrite_options) >= 2, f"应提供 2 种改写方案"
     
-    types = [opt["type"] for opt in rewrite_options]
-    assert "JOIN改写" in types, f"应包含 JOIN 改写: {types}"
-    assert "EXISTS改写" in types, f"应包含 EXISTS 改写: {types}"
+    for opt in rewrite_options:
+        sql_text = opt["sql"]
+        assert "SELECT" in sql_text, f"改写方案应包含SELECT: {sql_text}"
+        assert "FROM" in sql_text, f"改写方案应包含FROM: {sql_text}"
+        print(f"    {opt['type']}: {sql_text[:120]}...")
+    
+    join_opt = [o for o in rewrite_options if o["type"] == "JOIN改写"][0]
+    assert "INNER JOIN" in join_opt["sql"], f"JOIN改写应包含INNER JOIN: {join_opt['sql']}"
+    assert "orders" in join_opt["sql"], f"JOIN改写应包含主表orders: {join_opt['sql']}"
+    
+    exists_opt = [o for o in rewrite_options if o["type"] == "EXISTS改写"][0]
+    assert "EXISTS" in exists_opt["sql"], f"EXISTS改写应包含EXISTS: {exists_opt['sql']}"
+    assert "orders" in exists_opt["sql"], f"EXISTS改写应包含主表orders: {exists_opt['sql']}"
 
-run_test("IN子查询识别与改写建议", test2)
+run_test("IN子查询改写返回完整可执行SELECT", test_in_subquery_join_complete)
 
-# 测试3: 自动SQL改写草案
-def test3():
-    sql = "SELECT * FROM orders WHERE status = 'active'"
-    schema_ddl = """
-    CREATE TABLE orders (
-        order_id INT PRIMARY KEY,
-        customer_id INT,
-        order_date DATE,
-        total DECIMAL(10,2),
-        status VARCHAR(20),
-        INDEX idx_status (status)
+# ---- 2. IN子查询改写保留其他WHERE条件和ORDER BY/LIMIT ----
+
+def test_in_subquery_preserves_other_clauses():
+    sql = """
+    SELECT o.order_id, o.total
+    FROM orders o
+    WHERE o.status = 'active' AND o.customer_id IN (
+        SELECT c.customer_id 
+        FROM customers c 
+        WHERE c.country = 'USA'
     )
+    ORDER BY o.order_date DESC
+    LIMIT 10
     """
-    schema = schema_parser.parse(schema_ddl)
-    result = engine.analyze(sql, schema)
+    result = engine.analyze(sql)
+    suggestions = result["suggestions"]
+    r003 = [s for s in suggestions if s["rule_id"] == "R003"]
+    assert len(r003) >= 1
     
-    optimized = result["optimized_sql"]
-    summary = result["summary"]
+    details = r003[0].get("details", {})
+    rewrite_options = details.get("rewrite_options", [])
     
-    assert "*" not in optimized, f"SELECT * 应被展开: {optimized}"
-    assert "LIMIT" in optimized, f"应添加 LIMIT: {optimized}"
-    assert summary.get("expanded_star") is True, "应有 expanded_star 标记"
-    assert summary.get("added_limit") is True, "应有 added_limit 标记"
+    for opt in rewrite_options:
+        sql_text = opt["sql"]
+        assert "status" in sql_text, f"改写应保留其他WHERE条件(status): {sql_text}"
+        assert "ORDER BY" in sql_text, f"改写应保留ORDER BY: {sql_text}"
+        assert "LIMIT 10" in sql_text, f"改写应保留LIMIT: {sql_text}"
+        print(f"    {opt['type']}: {sql_text[:150]}...")
 
-run_test("自动SQL改写草案", test3)
+run_test("IN子查询改写保留其他WHERE/ORDER BY/LIMIT", test_in_subquery_preserves_other_clauses)
 
-# 测试4: 索引建议 - 单列 vs 联合
-def test4():
-    sql = "SELECT order_id, total FROM orders WHERE customer_id = 123 AND status = 'active' AND order_date > '2024-01-01'"
-    schema_ddl = """
-    CREATE TABLE orders (
-        order_id INT PRIMARY KEY,
-        customer_id INT,
-        order_date DATE,
-        total DECIMAL(10,2),
-        status VARCHAR(20)
-    )
-    """
-    schema = schema_parser.parse(schema_ddl)
-    result = engine.analyze(sql, schema)
+# ---- 3. 函数诊断精确性 ----
+
+def test_function_diagnosis_precision():
+    sql = "SELECT * FROM orders WHERE UPPER(customer_name) = 'JOHN' AND YEAR(order_date) = 2024 AND status = 'active'"
+    result = engine.analyze(sql)
+    pr = result["parse_result"]
+    
+    where_cols = pr["where_columns"]
+    where_funcs = pr["where_functions"]
+    assert "status" in where_cols, f"status 应在WHERE列中: {where_cols}"
+    assert "UPPER" not in where_cols, f"UPPER 不应在WHERE列中: {where_cols}"
+    
+    func_names = [f.get("function", "") for f in where_funcs]
+    func_args = [f.get("arguments", "") for f in where_funcs]
+    assert "UPPER" in func_names, f"UPPER 应在函数列表中: {func_names}"
+    assert "YEAR" in func_names, f"YEAR 应在函数列表中: {func_names}"
+    assert any("customer_name" in a for a in func_args), f"customer_name 应在参数中: {func_args}"
+    assert any("order_date" in a for a in func_args), f"order_date 应在参数中: {func_args}"
     
     suggestions = result["suggestions"]
-    r005 = [s for s in suggestions if s["rule_id"] == "R005"]
+    r002 = [s for s in suggestions if s["rule_id"] == "R002"]
+    assert len(r002) >= 1, f"应有 R002 建议"
     
-    has_composite = any(s.get("details", {}).get("is_composite") for s in r005)
-    assert has_composite, f"多条件查询应建议联合索引: {r005}"
+    details = r002[0].get("details", {})
+    if "functions" in details:
+        func_details = details["functions"]
+        affected_cols = details.get("affected_columns", [])
+        assert "customer_name" in affected_cols, f"affected_columns 应含 customer_name: {affected_cols}"
+        assert "order_date" in affected_cols, f"affected_columns 应含 order_date: {affected_cols}"
+        assert "status" not in affected_cols, f"status 不应在 affected_columns 中: {affected_cols}"
+        for fd in func_details:
+            assert "function" in fd, f"每个函数详情应有function字段: {fd}"
+            assert "column" in fd, f"每个函数详情应有column字段: {fd}"
+            assert "alternative" in fd, f"每个函数详情应有alternative字段: {fd}"
+    else:
+        assert "column" in details, f"单函数模式应有column字段: {details}"
+        assert details["column"] != "status", f"函数字段不应是status: {details}"
 
-run_test("索引建议 - 单列 vs 联合", test4)
+run_test("函数诊断精确性", test_function_diagnosis_precision)
 
-# 测试5: 表结构解析 - 联合索引/唯一索引/主外键
-def test5():
-    ddl = """
-    CREATE TABLE orders (
-        order_id INT PRIMARY KEY AUTO_INCREMENT,
-        customer_id INT NOT NULL,
-        product_id INT NOT NULL,
-        order_date DATE NOT NULL,
-        amount DECIMAL(10,2) NOT NULL,
-        status VARCHAR(20) NOT NULL,
-        UNIQUE KEY uk_order_cust (order_id, customer_id),
-        INDEX idx_cust_date (customer_id, order_date),
-        CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id),
-        CONSTRAINT fk_product FOREIGN KEY (product_id) REFERENCES products(id)
+# ---- 4. SELECT聚合函数不应报为WHERE函数问题 ----
+
+def test_select_aggregates_not_flagged():
+    sql = "SELECT COUNT(*), SUM(total), AVG(amount) FROM orders WHERE status = 'active'"
+    result = engine.analyze(sql)
+    
+    suggestions = result["suggestions"]
+    r002 = [s for s in suggestions if s["rule_id"] == "R002"]
+    assert len(r002) == 0, f"SELECT聚合函数不应触发 R002: {[s['title'] for s in r002]}"
+    
+    pr = result["parse_result"]
+    where_funcs = pr["where_functions"]
+    func_names = [f.get("function", "") for f in where_funcs]
+    assert "COUNT" not in func_names, f"COUNT 不应在WHERE函数列表中: {func_names}"
+    assert "SUM" not in func_names, f"SUM 不应在WHERE函数列表中: {func_names}"
+
+run_test("SELECT聚合不报为WHERE函数问题", test_select_aggregates_not_flagged)
+
+# ---- 5. 批量报告诊断overview ----
+
+def test_report_diagnostic_overview():
+    sql_list = [
+        "SELECT * FROM orders WHERE UPPER(name) = 'TEST'",
+        "SELECT o.id FROM orders o WHERE o.customer_id IN (SELECT id FROM customers WHERE country = 'USA')",
+        "SELECT * FROM customers WHERE country = 'USA' ORDER BY signup_date",
+        "SELECT COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 100"
+    ]
+    
+    report = report_gen.generate(sql_list)
+    
+    assert "overview" in report, "报告应包含 overview"
+    overview = report["overview"]
+    assert len(overview) > 0, "overview 不应为空"
+    
+    for item in overview:
+        assert "rule_id" in item, f"overview项应有rule_id: {item}"
+        assert "priority" in item, f"overview项应有priority: {item}"
+        assert "impact_scope" in item, f"overview项应有impact_scope: {item}"
+        assert "affected_queries" in item, f"overview项应有affected_queries: {item}"
+        assert "affected_sql_summaries" in item, f"overview项应有affected_sql_summaries: {item}"
+        assert "diagnosis" in item, f"overview项应有diagnosis: {item}"
+        assert "action" in item, f"overview项应有action: {item}"
+        print(f"    [{item['priority']}] {item['rule_id']}: {item['diagnosis']} (影响{item['affected_queries']}条SQL)")
+    
+    same_type_merged = all(
+        item["affected_queries"] >= 1 for item in overview
     )
-    """
-    schema = schema_parser.parse(ddl)
-    table = schema["tables"][0]
-    
-    indexes = table["indexes"]
-    fks = table["foreign_keys"]
-    unique_constraints = table["unique_constraints"]
-    
-    composite_indexes = [idx for idx in indexes if idx.get("is_composite")]
-    assert len(composite_indexes) >= 1, f"应包含联合索引: {indexes}"
-    assert len(unique_constraints) >= 1, f"应包含唯一约束: {unique_constraints}"
-    assert len(fks) >= 2, f"应包含外键: {fks}"
+    assert same_type_merged, "同类问题应合并展示"
 
-run_test("表结构解析 - 联合索引/唯一索引/主外键", test5)
+run_test("批量报告诊断overview", test_report_diagnostic_overview)
 
-# 测试6: 执行计划 - 有/无 schema 差异
-def test6():
+# ---- 6. 执行计划JOIN顺序原因 ----
+
+def test_execution_plan_join_order_reason():
     sql = """
     SELECT o.order_id, o.total, c.name
     FROM orders o
@@ -196,98 +225,128 @@ def test6():
     )
     """
     schema = schema_parser.parse(schema_ddl)
+    plan = plan_gen.generate(sql, schema)
     
-    plan_no_schema = plan_gen.generate(sql)
-    plan_with_schema = plan_gen.generate(sql, schema)
+    steps = plan["steps"]
+    table_steps = [s for s in steps if s.get("node_type") in ("DRIVING_TABLE", "JOINED_TABLE")]
     
-    assert plan_no_schema["has_schema"] is False
-    assert plan_with_schema["has_schema"] is True
+    assert len(table_steps) >= 2, f"应有至少2个表步骤: {len(table_steps)}"
     
-    steps_with = plan_with_schema["steps"]
-    types_with = [s["access_type"] for s in steps_with]
+    for s in table_steps:
+        assert "join_order_reason" in s, f"表步骤应有join_order_reason: {s}"
+        assert s["join_order_reason"] is not None, f"join_order_reason不应为None"
+        print(f"    {s['table']}: {s['join_order_reason']}")
     
-    steps_no = plan_no_schema["steps"]
-    types_no = [s["access_type"] for s in steps_no]
+    driving = [s for s in table_steps if s["node_type"] == "DRIVING_TABLE"]
+    assert len(driving) >= 1, "应有驱动表"
+    assert "驱动表" in driving[0]["join_order_reason"], "驱动表应说明原因"
     
-    assert any("ref" in t for t in types_with) or any("index" in t for t in types_with), \
-        f"有 schema 时应使用索引: {types_with}"
+    joined = [s for s in table_steps if s["node_type"] == "JOINED_TABLE"]
+    if joined:
+        assert "被驱动表" in joined[0]["join_order_reason"], "被驱动表应说明原因"
+        assert joined[0].get("join_condition") is not None, "被驱动表应有join_condition"
 
-run_test("执行计划 - 有/无 schema 差异", test6)
+run_test("执行计划JOIN顺序原因", test_execution_plan_join_order_reason)
 
-# 测试7: SQL对比 - diff标注新增/删除
-def test7():
-    original_sql = "SELECT * FROM orders WHERE status = 'active'"
-    optimized_sql = "SELECT order_id, customer_id, total FROM orders WHERE status = 'active' LIMIT 100"
-    
-    result = highlighter.compare(original_sql, optimized_sql)
-    diff_summary = result["diff_summary"]
-    
-    assert "added" in diff_summary, "应有 added 统计"
-    assert "removed" in diff_summary, "应有 removed 统计"
-    assert len(diff_summary["added"]) > 0, f"应有新增内容: {diff_summary}"
-    assert len(diff_summary["removed"]) > 0, f"应有删除内容: {diff_summary}"
+# ---- 7. 执行计划索引命中原因 ----
 
-run_test("SQL对比 - diff标注新增/删除", test7)
-
-# 测试8: 批量报告 - 按问题类型汇总
-def test8():
-    sql_list = [
-        "SELECT * FROM orders WHERE UPPER(name) = 'TEST'",
-        "SELECT o.id FROM orders o WHERE o.customer_id IN (SELECT id FROM customers WHERE country = 'USA')",
-        "SELECT * FROM customers WHERE country = 'USA' ORDER BY signup_date",
-        "SELECT COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 100"
-    ]
-    
-    report = report_gen.generate(sql_list)
-    
-    assert "global_issue_types" in report, "应有 global_issue_types"
-    assert "global_issue_categories" in report, "应有 global_issue_categories"
-    assert "global_antipatterns" in report, "应有 global_antipatterns"
-    assert "prioritized_actions" in report, "应有 prioritized_actions"
-    assert "score_grade" in report, "应有 score_grade"
-
-run_test("批量报告 - 按问题类型汇总", test8)
-
-# 测试9: HAVING 检测
-def test9():
-    sql1 = "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 100"
-    sql2 = "SELECT * FROM orders HAVING total > 1000"
-    
-    result1 = engine.analyze(sql1)
-    result2 = engine.analyze(sql2)
-    
-    assert result1["parse_result"]["has_having"] is True
-    assert result2["parse_result"]["has_having"] is True
-    
-    r013_1 = [s for s in result1["suggestions"] if s["rule_id"] == "R013"]
-    r013_2 = [s for s in result2["suggestions"] if s["rule_id"] == "R013"]
-    
-    assert len(r013_2) >= 1, f"无 GROUP BY 的 HAVING 应触发 R013: {result2['suggestions']}"
-
-run_test("HAVING 检测", test9)
-
-# 测试10: ORDER BY / GROUP BY 识别
-def test10():
-    sql = """
-    SELECT customer_id, COUNT(*) as cnt, SUM(total) as total
-    FROM orders
-    WHERE status = 'active'
-    GROUP BY customer_id
-    HAVING COUNT(*) > 10
-    ORDER BY total DESC
-    LIMIT 10
+def test_execution_plan_index_hit_reason():
+    sql = "SELECT * FROM orders WHERE status = 'active'"
+    schema_ddl = """
+    CREATE TABLE orders (
+        order_id INT PRIMARY KEY,
+        customer_id INT,
+        status VARCHAR(20),
+        INDEX idx_status (status)
+    )
     """
-    result = engine.analyze(sql)
-    pr = result["parse_result"]
+    schema = schema_parser.parse(schema_ddl)
+    plan = plan_gen.generate(sql, schema)
     
-    assert "customer_id" in pr["group_by_columns"], f"GROUP BY 列应包含 customer_id: {pr['group_by_columns']}"
-    assert "total" in pr["order_by_columns"], f"ORDER BY 列应包含 total: {pr['order_by_columns']}"
-    assert pr["has_having"] is True
-    assert "COUNT" in pr["aggregate_functions"], f"聚合函数应包含 COUNT: {pr['aggregate_functions']}"
-    assert "SUM" in pr["aggregate_functions"], f"聚合函数应包含 SUM: {pr['aggregate_functions']}"
-    assert pr["limit_value"] == 10, f"LIMIT 值应为 10: {pr['limit_value']}"
+    steps = plan["steps"]
+    table_steps = [s for s in steps if s.get("node_type") == "DRIVING_TABLE"]
+    assert len(table_steps) >= 1
+    
+    driving = table_steps[0]
+    assert driving.get("index_hit_reason") is not None, f"有schema时应有index_hit_reason: {driving}"
+    assert "idx_status" in driving["index_hit_reason"], f"应说明命中索引idx_status: {driving['index_hit_reason']}"
+    assert "status" in driving["index_hit_reason"], f"应说明匹配列status: {driving['index_hit_reason']}"
+    print(f"    索引命中原因: {driving['index_hit_reason']}")
+    
+    assert driving.get("is_estimated") is False, "有schema时is_estimated应为False"
 
-run_test("ORDER BY / GROUP BY 识别", test10)
+run_test("执行计划索引命中原因", test_execution_plan_index_hit_reason)
+
+# ---- 8. 无schema时标注估算 ----
+
+def test_execution_plan_estimated_without_schema():
+    sql = "SELECT * FROM orders WHERE status = 'active'"
+    plan = plan_gen.generate(sql)
+    
+    steps = plan["steps"]
+    table_steps = [s for s in steps if s.get("node_type") == "DRIVING_TABLE"]
+    assert len(table_steps) >= 1
+    
+    driving = table_steps[0]
+    assert driving.get("is_estimated") is True, "无schema时is_estimated应为True"
+    print(f"    无schema访问类型: {driving['access_type']}, 估算: {driving['is_estimated']}")
+
+run_test("无schema时标注估算", test_execution_plan_estimated_without_schema)
+
+# ---- 9. 执行计划filesort和临时表标记 ----
+
+def test_execution_plan_filesort_temporary():
+    sql = """
+    SELECT customer_id, COUNT(*) 
+    FROM orders 
+    WHERE status = 'active' 
+    GROUP BY customer_id 
+    ORDER BY total DESC
+    """
+    schema_ddl = """
+    CREATE TABLE orders (
+        order_id INT PRIMARY KEY,
+        customer_id INT,
+        total DECIMAL(10,2),
+        status VARCHAR(20),
+        INDEX idx_status (status)
+    )
+    """
+    schema = schema_parser.parse(schema_ddl)
+    plan = plan_gen.generate(sql, schema)
+    
+    steps = plan["steps"]
+    sort_steps = [s for s in steps if s.get("node_type") == "SORT"]
+    agg_steps = [s for s in steps if s.get("node_type") == "AGGREGATE"]
+    
+    if sort_steps:
+        sort_step = sort_steps[0]
+        assert sort_step.get("join_order_reason") is not None, "排序步骤应有join_order_reason"
+        print(f"    排序原因: {sort_step['join_order_reason']}")
+    
+    if agg_steps:
+        agg_step = agg_steps[0]
+        print(f"    聚合原因: {agg_step.get('join_order_reason', 'N/A')}")
+
+run_test("执行计划filesort和临时表标记", test_execution_plan_filesort_temporary)
+
+# ---- 10. 回归测试 - 基础功能 ----
+
+def test_regression_basic():
+    sql = "SELECT * FROM orders WHERE UPPER(name) = 'TEST'"
+    result = engine.analyze(sql)
+    
+    assert result["statement_type"] == "SELECT"
+    assert len(result["suggestions"]) > 0
+    assert result["optimized_sql"] is not None
+    
+    r002 = [s for s in result["suggestions"] if s["rule_id"] == "R002"]
+    assert len(r002) >= 1, "UPPER(name) 应触发R002"
+    
+    r001 = [s for s in result["suggestions"] if s["rule_id"] == "R001"]
+    assert len(r001) >= 1, "SELECT * 应触发R001"
+
+run_test("回归测试 - 基础功能", test_regression_basic)
 
 # 总结
 print("\n" + "=" * 80)

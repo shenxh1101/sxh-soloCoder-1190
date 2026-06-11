@@ -106,32 +106,93 @@ class AvoidSelectStarRule(Rule):
 
 
 class AvoidFunctionOnWhereColumnRule(Rule):
+    AGGREGATE_FUNCTIONS = frozenset([
+        "SUM", "AVG", "COUNT", "MIN", "MAX", "GROUP_CONCAT",
+        "STDDEV", "VARIANCE", "BIT_AND", "BIT_OR", "BIT_XOR",
+    ])
+
     def check(self, parse_result: SQLParseResult, schema_info=None):
         suggestions = []
-        if parse_result.where_functions:
-            for func_name in parse_result.where_functions:
-                affected_columns = []
-                for col in parse_result.where_columns:
-                    affected_columns.append(col)
+        if not parse_result.where_functions:
+            return suggestions
 
-                suggestions.append(
-                    OptimizationSuggestion(
-                        rule_id="R002",
-                        severity="high",
-                        title="避免在WHERE子句中对字段使用函数",
-                        description=(
-                            f"在WHERE子句中使用函数 {func_name}() 会导致数据库无法使用该列上的索引，"
-                            f"触发全表扫描。建议改写查询逻辑，使字段保持裸列形式。"
-                        ),
-                        original=f"WHERE {func_name.lower()}(column) = ...",
-                        suggested="WHERE column = {processed_value}",
-                        details={
-                            "function": func_name,
-                            "affected_columns": affected_columns,
-                            "alternative": "将函数运算移到值侧，如 WHERE col = LOWER('VALUE')",
-                        },
-                    )
+        where_func_entries = []
+        for func_entry in parse_result.where_functions:
+            if isinstance(func_entry, dict):
+                func_name = func_entry.get("function", "")
+                if func_name in self.AGGREGATE_FUNCTIONS:
+                    continue
+                func_args = func_entry.get("arguments", "")
+                full_expr = func_entry.get("full_expression", f"{func_name}({func_args})")
+                arg_cols = [c.strip() for c in func_args.split(".")[-1].split(",")]
+                where_func_entries.append({
+                    "function": func_name,
+                    "column": func_args,
+                    "column_simple": arg_cols[0] if arg_cols else func_args,
+                    "full_expression": full_expr,
+                })
+
+        if not where_func_entries:
+            return suggestions
+
+        if len(where_func_entries) == 1:
+            entry = where_func_entries[0]
+            suggestions.append(
+                OptimizationSuggestion(
+                    rule_id="R002",
+                    severity="high",
+                    title="避免在WHERE子句中对字段使用函数",
+                    description=(
+                        f"WHERE子句中对列 '{entry['column_simple']}' 使用了函数 {entry['function']}()，"
+                        f"会导致数据库无法使用该列上的索引，触发全表扫描。"
+                        f"建议将函数运算移到值侧，使字段保持裸列形式。"
+                    ),
+                    original=entry["full_expression"],
+                    suggested=f"{entry['column_simple']} = {entry['function'].lower()}(...)",
+                    details={
+                        "function": entry["function"],
+                        "column": entry["column_simple"],
+                        "full_expression": entry["full_expression"],
+                        "alternative": f"将 {entry['full_expression']} 改写为 {entry['column_simple']} = {entry['function'].lower()}(value)",
+                        "impact": "索引失效，触发全表扫描",
+                    },
                 )
+            )
+        else:
+            func_summary = "; ".join(
+                f"{e['function']}({e['column_simple']})" for e in where_func_entries
+            )
+            detail_list = [
+                {
+                    "function": e["function"],
+                    "column": e["column_simple"],
+                    "full_expression": e["full_expression"],
+                    "alternative": f"将 {e['full_expression']} 改写为 {e['column_simple']} = {e['function'].lower()}(value)",
+                }
+                for e in where_func_entries
+            ]
+            suggestions.append(
+                OptimizationSuggestion(
+                    rule_id="R002",
+                    severity="high",
+                    title=f"避免在WHERE子句中对{len(where_func_entries)}个字段使用函数",
+                    description=(
+                        f"WHERE子句中对多个列使用了函数 ({func_summary})，"
+                        f"会导致这些列上的索引失效，触发全表扫描。"
+                        f"建议将函数运算移到值侧，使字段保持裸列形式。"
+                    ),
+                    original="; ".join(e["full_expression"] for e in where_func_entries),
+                    suggested="; ".join(
+                        f"{e['column_simple']} = {e['function'].lower()}(...)" for e in where_func_entries
+                    ),
+                    details={
+                        "functions": detail_list,
+                        "affected_columns": [e["column_simple"] for e in where_func_entries],
+                        "impact": "多个列索引失效，触发全表扫描",
+                    },
+                )
+            )
+
         return suggestions
 
 
@@ -216,12 +277,39 @@ class InSubqueryToJoinRule(Rule):
 
         select_part = self._rebuild_select(parse_result, main_prefix, subq_alias)
 
-        return (
-            f"{select_part} "
+        from_parts = []
+        for tbl in parse_result.tables:
+            alias = None
+            for a, t in parse_result.table_aliases.items():
+                if t == tbl:
+                    alias = a
+                    break
+            if alias:
+                from_parts.append(f"{tbl} {alias}")
+            else:
+                from_parts.append(tbl)
+        from_clause = "FROM " + ", ".join(from_parts)
+
+        other_where = self._extract_other_where_conditions(parse_result, col, in_type)
+
+        join_clause = (
             f"{join_type} (SELECT DISTINCT {col_simple} FROM {subq_table} WHERE {subq_where}) {subq_alias} "
             f"ON {main_prefix}{col_simple} = {subq_alias}.{col_simple}"
-            f"{extra_where}"
         )
+
+        sql_parts = [select_part, from_clause, join_clause]
+        if other_where:
+            sql_parts.append(f"WHERE {other_where}{extra_where}")
+        elif extra_where:
+            sql_parts.append(f"WHERE 1=1{extra_where}")
+
+        if parse_result.order_by_columns:
+            order_clause = ", ".join(parse_result.order_by_columns)
+            sql_parts.append(f"ORDER BY {order_clause}")
+        if parse_result.limit_value is not None:
+            sql_parts.append(f"LIMIT {parse_result.limit_value}")
+
+        return " ".join(sql_parts)
 
     def _build_exists_version(self, parse_result, col, subq_table, subq_where, subq_select_col, subq_alias, in_type):
         col_simple = col.split(".")[-1] if "." in col else col
@@ -230,18 +318,66 @@ class InSubqueryToJoinRule(Rule):
         main_prefix = f"{main_alias[0]}." if main_alias else ""
 
         operator = "NOT EXISTS" if in_type == "NOT_IN" else "EXISTS"
-
         subq_select_col_simple = subq_select_col.split(".")[-1]
 
         select_part = self._rebuild_select(parse_result, main_prefix, None)
 
-        return (
-            f"{select_part} "
-            f"WHERE {operator} ("
+        from_parts = []
+        for tbl in parse_result.tables:
+            alias = None
+            for a, t in parse_result.table_aliases.items():
+                if t == tbl:
+                    alias = a
+                    break
+            if alias:
+                from_parts.append(f"{tbl} {alias}")
+            else:
+                from_parts.append(tbl)
+        from_clause = "FROM " + ", ".join(from_parts)
+
+        other_where = self._extract_other_where_conditions(parse_result, col, in_type)
+
+        exists_clause = (
+            f"{operator} ("
             f"SELECT 1 FROM {subq_table} {subq_alias} "
             f"WHERE {subq_alias}.{subq_select_col_simple} = {main_prefix}{col_simple} "
             f"AND {subq_where})"
         )
+
+        where_parts = []
+        if other_where:
+            where_parts.append(other_where)
+        where_parts.append(exists_clause)
+        where_clause = "WHERE " + " AND ".join(where_parts)
+
+        sql_parts = [select_part, from_clause, where_clause]
+        if parse_result.order_by_columns:
+            order_clause = ", ".join(parse_result.order_by_columns)
+            sql_parts.append(f"ORDER BY {order_clause}")
+        if parse_result.limit_value is not None:
+            sql_parts.append(f"LIMIT {parse_result.limit_value}")
+
+        return " ".join(sql_parts)
+
+    def _extract_other_where_conditions(self, parse_result, in_col, in_type):
+        if not parse_result.where_clause:
+            return ""
+        where_text = parse_result.where_clause
+        where_text = re.sub(r'^WHERE\s+', '', where_text, flags=re.IGNORECASE).strip()
+
+        for in_subq in parse_result.in_subqueries:
+            original_text = in_subq["original"]
+            where_text = where_text.replace(original_text, "")
+
+        where_text = re.sub(r'\bAND\s+AND\b', 'AND', where_text, flags=re.IGNORECASE)
+        where_text = re.sub(r'^\s*AND\s+', '', where_text, flags=re.IGNORECASE)
+        where_text = re.sub(r'\s+AND\s*$', '', where_text, flags=re.IGNORECASE)
+        where_text = where_text.strip()
+
+        if where_text.startswith('(') and where_text.endswith(')'):
+            where_text = where_text[1:-1].strip()
+
+        return where_text
 
     def _rebuild_select(self, parse_result, main_prefix, subq_alias):
         cols = parse_result.columns

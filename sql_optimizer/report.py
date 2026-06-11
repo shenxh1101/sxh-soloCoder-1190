@@ -125,6 +125,7 @@ class ReportGenerator:
             "total_queries": len(sql_list),
             "overall_score": overall_score,
             "score_grade": self._get_score_grade(overall_score),
+            "overview": self._build_diagnostic_overview(all_suggestions_flat, results),
             "total_suggestions": sum(r["suggestions_count"] for r in results),
             "global_severity_summary": {
                 "high": total_high,
@@ -184,6 +185,108 @@ class ReportGenerator:
             return {"grade": "D", "label": "较差", "color": "#fd7e14"}
         else:
             return {"grade": "E", "label": "严重", "color": "#dc3545"}
+
+    def _build_diagnostic_overview(self, all_suggestions_flat, results):
+        issue_groups = {}
+        for s in all_suggestions_flat:
+            rid = s.get("rule_id", "")
+            if rid == "ERR":
+                continue
+            if rid not in issue_groups:
+                issue_groups[rid] = {
+                    "rule_id": rid,
+                    "title": s.get("title", ""),
+                    "severity": s.get("severity", ""),
+                    "category": s.get("category", ""),
+                    "subcategory": s.get("subcategory", ""),
+                    "affected_sql_indices": [],
+                    "affected_sql_summaries": [],
+                    "count": 0,
+                    "details_samples": [],
+                }
+            issue_groups[rid]["count"] += 1
+            if len(issue_groups[rid]["details_samples"]) < 2:
+                issue_groups[rid]["details_samples"].append({
+                    "description": s.get("description", ""),
+                    "suggested": s.get("suggested", ""),
+                })
+
+        for idx, r in enumerate(results):
+            seen_rids = set()
+            for s in r.get("suggestions", []):
+                rid = s.get("rule_id", "")
+                if rid in issue_groups and rid not in seen_rids:
+                    issue_groups[rid]["affected_sql_indices"].append(idx)
+                    sql_short = r["original_sql"].strip().replace("\n", " ")
+                    if len(sql_short) > 80:
+                        sql_short = sql_short[:77] + "..."
+                    issue_groups[rid]["affected_sql_summaries"].append(sql_short)
+                    seen_rids.add(rid)
+
+        severity_priority = {"high": 0, "medium": 1, "low": 2}
+        sorted_groups = sorted(
+            issue_groups.values(),
+            key=lambda g: (severity_priority.get(g["severity"], 3), -g["count"])
+        )
+
+        overview_items = []
+        for g in sorted_groups:
+            impact = "全局" if g["count"] >= 3 else ("多查询" if g["count"] >= 2 else "单查询")
+            priority = "P0" if g["severity"] == "high" else ("P1" if g["severity"] == "medium" else "P2")
+
+            item = {
+                "rule_id": g["rule_id"],
+                "title": g["title"],
+                "severity": g["severity"],
+                "category": g["category"],
+                "subcategory": g["subcategory"],
+                "priority": priority,
+                "impact_scope": impact,
+                "affected_queries": g["count"],
+                "affected_sql_summaries": g["affected_sql_summaries"],
+                "samples": g["details_samples"],
+            }
+
+            if g["rule_id"] == "R002":
+                item["diagnosis"] = "WHERE子句函数导致索引失效，需将函数移至值侧"
+                item["action"] = "改写 WHERE 条件，保持列为裸列"
+            elif g["rule_id"] == "R003":
+                item["diagnosis"] = "IN/NOT IN 子查询产生临时表，性能较差"
+                item["action"] = "改写为 JOIN 或 EXISTS"
+            elif g["rule_id"] == "R001":
+                item["diagnosis"] = "SELECT * 导致不必要数据传输"
+                item["action"] = "展开为具体字段列表"
+            elif g["rule_id"] == "R004":
+                item["diagnosis"] = "JOIN关联列缺少索引，嵌套循环效率低"
+                item["action"] = "为关联列创建索引"
+            elif g["rule_id"] == "R005":
+                item["diagnosis"] = "WHERE过滤列缺少索引支持"
+                item["action"] = "根据查询模式创建单列或联合索引"
+            elif g["rule_id"] == "R006":
+                item["diagnosis"] = "ORDER BY列缺少索引，需额外排序"
+                item["action"] = "为排序列创建索引消除filesort"
+            elif g["rule_id"] == "R007":
+                item["diagnosis"] = "LIKE前缀通配符导致索引失效"
+                item["action"] = "改用前缀匹配或全文索引"
+            elif g["rule_id"] == "R008":
+                item["diagnosis"] = "无限制查询可能返回海量数据"
+                item["action"] = "添加 LIMIT 子句"
+            elif g["rule_id"] == "R011":
+                item["diagnosis"] = "NOT IN 有NULL陷阱且性能差"
+                item["action"] = "改写为 NOT EXISTS 或 LEFT JOIN IS NULL"
+            elif g["rule_id"] == "R012":
+                item["diagnosis"] = "隐式类型转换导致索引失效"
+                item["action"] = "确保比较值类型与列类型一致"
+            elif g["rule_id"] == "R013":
+                item["diagnosis"] = "HAVING缺少GROUP BY，条件应在WHERE"
+                item["action"] = "将非聚合条件移至WHERE"
+            else:
+                item["diagnosis"] = g["title"]
+                item["action"] = g.get("details_samples", [{}])[0].get("suggested", "参考建议详情")
+
+            overview_items.append(item)
+
+        return overview_items
 
     def _generate_prioritized_actions(self, all_suggestions, schema_info):
         actions = []

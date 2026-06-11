@@ -5,7 +5,8 @@ from .parser import SQLParser
 
 class PlanNode:
     def __init__(self, node_type, table=None, alias=None, access_type="ALL", key=None,
-                 rows=None, extra=None, children=None, filtered=None, possible_keys=None):
+                 rows=None, extra=None, children=None, filtered=None, possible_keys=None,
+                 index_hit_reason=None):
         self.node_type = node_type
         self.table = table
         self.alias = alias
@@ -16,6 +17,7 @@ class PlanNode:
         self.children = children or []
         self.filtered = filtered
         self.possible_keys = possible_keys
+        self.index_hit_reason = index_hit_reason
 
     def to_dict(self):
         result = {
@@ -32,6 +34,7 @@ class PlanNode:
             "filtered": self.filtered,
             "Extra": self.extra,
             "node_type": self.node_type,
+            "index_hit_reason": self.index_hit_reason,
         }
         if self.children:
             result["children"] = [c.to_dict() for c in self.children]
@@ -131,8 +134,8 @@ class ExecutionPlanGenerator:
         root = self._build_plan(parse_result, schema_info)
 
         steps = []
-        for child in root.children:
-            steps.append({
+        for i, child in enumerate(root.children):
+            step = {
                 "node_type": child.node_type,
                 "table": child.table,
                 "alias": child.alias,
@@ -142,7 +145,33 @@ class ExecutionPlanGenerator:
                 "filtered": child.filtered,
                 "extra": child.extra,
                 "possible_keys": child.possible_keys,
-            })
+                "index_hit_reason": child.index_hit_reason,
+                "is_estimated": schema_info is None,
+                "join_order_reason": None,
+                "join_condition": None,
+            }
+
+            if child.node_type == "DRIVING_TABLE":
+                step["join_order_reason"] = "作为驱动表优先扫描，WHERE过滤条件最多或表行数最少"
+                if child.index_hit_reason:
+                    step["join_order_reason"] += f"；{child.index_hit_reason}"
+            elif child.node_type == "JOINED_TABLE":
+                step["join_order_reason"] = "作为被驱动表，通过JOIN条件与驱动表关联"
+                join_idx = i - 1
+                if join_idx < len(parse_result.join_conditions):
+                    step["join_condition"] = parse_result.join_conditions[join_idx]
+            elif child.node_type == "SUBQUERY_MATERIALIZATION":
+                step["join_order_reason"] = "IN/NOT IN子查询物化为临时表"
+            elif child.node_type == "SORT":
+                step["join_order_reason"] = "结果集排序"
+                if "filesort" in (child.extra or "").lower():
+                    step["join_order_reason"] += "，需额外排序操作(Using filesort)"
+            elif child.node_type == "AGGREGATE":
+                step["join_order_reason"] = "聚合计算"
+                if "temporary" in (child.extra or "").lower():
+                    step["join_order_reason"] += "，需创建临时表(Using temporary)"
+
+            steps.append(step)
 
         return {
             "plan_text": root.to_text(with_border=False, skip_self=True),
@@ -178,14 +207,21 @@ class ExecutionPlanGenerator:
                     alias = a
                     break
 
-            access_type, key, rows, extra, possible_keys, filtered = self._determine_access(
+            access_type, key, rows, extra, possible_keys, filtered, index_hit_reason = self._determine_access(
                 table, parse_result, schema_info
             )
             total_rows += rows
 
             if i == 0:
                 node_type = "DRIVING_TABLE"
-                extra = f"驱动表 {extra}"
+                where_match_count = sum(
+                    1 for c in parse_result.where_columns
+                    if c.split(".")[-1] in [col.get("name", "") for col in self._get_table_columns(table, schema_info)]
+                )
+                if where_match_count > 0:
+                    extra = f"驱动表(WHERE过滤列×{where_match_count}), {extra}"
+                else:
+                    extra = f"驱动表, {extra}"
             else:
                 node_type = "JOINED_TABLE"
                 join_type = (
@@ -198,7 +234,7 @@ class ExecutionPlanGenerator:
                     if i - 1 < len(parse_result.join_conditions)
                     else "N/A"
                 )
-                extra = f"{join_type} ON {cond} {extra}".strip()
+                extra = f"{join_type} ON {cond}, {extra}".strip()
 
             join_nodes.append(
                 PlanNode(
@@ -211,6 +247,7 @@ class ExecutionPlanGenerator:
                     extra=extra,
                     possible_keys=possible_keys,
                     filtered=filtered,
+                    index_hit_reason=index_hit_reason,
                 )
             )
 
@@ -368,6 +405,7 @@ class ExecutionPlanGenerator:
         extra = ""
         possible_keys = None
         filtered = 100.0
+        index_hit_reason = None
 
         where_cols = parse_result.where_columns
         join_cols = []
@@ -433,18 +471,26 @@ class ExecutionPlanGenerator:
                     if access_type == "const":
                         rows = 1
                         extra = "主键唯一索引，单行查找"
+                        index_hit_reason = f"主键等值查询，命中索引{key}"
                         filtered = 100.0
                     elif access_type == "eq_ref":
                         rows = 1
                         extra = "唯一索引关联"
+                        index_hit_reason = f"唯一索引等值关联，命中索引{key}"
                         filtered = 100.0
                     elif access_type == "ref":
                         rows = max(1, estimated_rows // 100)
+                        matched_where_col = self._find_matched_where_col(candidate_cols, best_index)
+                        if matched_where_col:
+                            index_hit_reason = f"WHERE {matched_where_col} 匹配索引{key}首列"
+                        else:
+                            index_hit_reason = f"等值条件匹配索引{key}"
                         extra = f"索引{key}查找"
                         filtered = 10.0
                     elif access_type == "range":
                         rows = max(1, estimated_rows // 10)
                         extra = f"索引{key}范围扫描"
+                        index_hit_reason = f"范围条件使用索引{key}"
                         filtered = 33.3
 
                 possible_keys = possible_keys_list if possible_keys_list else None
@@ -470,7 +516,15 @@ class ExecutionPlanGenerator:
                 extra = "全表扫描，无过滤条件"
                 filtered = 100.0
 
-        return access_type, key, rows, extra, possible_keys, filtered
+        return access_type, key, rows, extra, possible_keys, filtered, index_hit_reason
+
+    def _find_matched_where_col(self, candidate_cols, best_index):
+        idx_first_col = best_index.get("columns", [""])[0] if best_index.get("columns") else ""
+        for col in candidate_cols:
+            col_simple = col.split(".")[-1] if "." in col else col
+            if col_simple == idx_first_col:
+                return col
+        return None
 
     def _estimate_rows(self, table_info):
         col_count = len(table_info.get("columns", []))
