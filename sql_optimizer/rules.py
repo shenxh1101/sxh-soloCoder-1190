@@ -206,28 +206,31 @@ class InSubqueryToJoinRule(Rule):
             original = in_subq["original"]
 
             subq_table_match = re.search(
-                r'FROM\s+(\w+)', subq, re.IGNORECASE | re.DOTALL
+                r'FROM\s+(\w+)(?:\s+(\w+))?', subq, re.IGNORECASE | re.DOTALL
             )
             subq_where_match = re.search(
                 r'WHERE\s+(.+?)$', subq, re.IGNORECASE | re.DOTALL
             )
-
             subq_select_match = re.search(
                 r'SELECT\s+(.+?)\s+FROM', subq, re.IGNORECASE | re.DOTALL
             )
 
             subq_table = subq_table_match.group(1) if subq_table_match else "subquery_table"
+            original_in_subq_alias = subq_table_match.group(2) if subq_table_match else None
             subq_where = subq_where_match.group(1).strip() if subq_where_match else "1=1"
             subq_select_col = subq_select_match.group(1).strip() if subq_select_match else col
 
             subq_alias = f"{subq_table}_subq" if subq_table_match else "sq"
 
             join_version = self._build_join_version(
-                parse_result, col, subq_table, subq_where, subq_alias, in_type
+                parse_result, col, subq_table, subq_where, subq_alias, in_type,
+                original_in_subq_alias=original_in_subq_alias,
+                subq_select_col_alias=subq_select_col,
             )
 
             exists_version = self._build_exists_version(
-                parse_result, col, subq_table, subq_where, subq_select_col, subq_alias, in_type
+                parse_result, col, subq_table, subq_where, subq_select_col, subq_alias, in_type,
+                original_in_subq_alias=original_in_subq_alias,
             )
 
             suggestions.append(
@@ -264,11 +267,31 @@ class InSubqueryToJoinRule(Rule):
             )
         return suggestions
 
-    def _build_join_version(self, parse_result, col, subq_table, subq_where, subq_alias, in_type):
+    def _build_join_version(self, parse_result, col, subq_table, subq_where, subq_alias, in_type,
+                            original_in_subq_alias=None, subq_select_col_alias=None):
         col_simple = col.split(".")[-1] if "." in col else col
-        main_table = parse_result.tables[0] if parse_result.tables else "main_table"
-        main_alias = [k for k, v in parse_result.table_aliases.items() if v == main_table]
-        main_prefix = f"{main_alias[0]}." if main_alias else ""
+        in_subq_table_alias = original_in_subq_alias or subq_alias
+
+        main_tables_parts = []
+        for tbl in parse_result.tables:
+            alias = None
+            for a, t in parse_result.table_aliases.items():
+                if t == tbl:
+                    alias = a
+                    break
+            if alias:
+                main_tables_parts.append(f"{tbl} {alias}")
+            else:
+                main_tables_parts.append(tbl)
+
+        first_table = main_tables_parts[0] if main_tables_parts else "main_table"
+        main_alias = None
+        if parse_result.table_aliases and parse_result.tables:
+            for a, t in parse_result.table_aliases.items():
+                if t == parse_result.tables[0]:
+                    main_alias = a
+                    break
+        main_prefix = f"{main_alias}." if main_alias else ""
 
         join_type = "INNER JOIN" if in_type == "IN" else "LEFT JOIN"
         extra_where = ""
@@ -277,52 +300,59 @@ class InSubqueryToJoinRule(Rule):
 
         select_part = self._rebuild_select(parse_result, main_prefix, subq_alias)
 
-        from_parts = []
-        for tbl in parse_result.tables:
-            alias = None
-            for a, t in parse_result.table_aliases.items():
-                if t == tbl:
-                    alias = a
-                    break
-            if alias:
-                from_parts.append(f"{tbl} {alias}")
-            else:
-                from_parts.append(tbl)
-        from_clause = "FROM " + ", ".join(from_parts)
-
-        other_where = self._extract_other_where_conditions(parse_result, col, in_type)
+        subq_join_col = subq_select_col_alias or col_simple
+        subq_where_adjusted = subq_where
+        if original_in_subq_alias and subq_where:
+            subq_where_adjusted = re.sub(
+                rf'\b{re.escape(original_in_subq_alias)}\.',
+                f"{in_subq_table_alias}.",
+                subq_where,
+            )
 
         join_clause = (
-            f"{join_type} (SELECT DISTINCT {col_simple} FROM {subq_table} WHERE {subq_where}) {subq_alias} "
+            f"{join_type} "
+            f"(SELECT DISTINCT {subq_join_col} AS {col_simple} "
+            f"FROM {subq_table} {in_subq_table_alias} "
+            f"WHERE {subq_where_adjusted}) {subq_alias} "
             f"ON {main_prefix}{col_simple} = {subq_alias}.{col_simple}"
         )
 
-        sql_parts = [select_part, from_clause, join_clause]
+        other_join_clauses = []
+        if len(parse_result.tables) > 1:
+            for i in range(1, len(parse_result.tables)):
+                join_idx = i - 1
+                jt = parse_result.join_types[join_idx] if join_idx < len(parse_result.join_types) else "INNER JOIN"
+                jc = parse_result.join_conditions[join_idx] if join_idx < len(parse_result.join_conditions) else "1=1"
+                other_join_clauses.append(f"{jt} {main_tables_parts[i]} ON {jc}")
+
+        other_where = self._extract_other_where_conditions(parse_result, col, in_type)
+
+        sql_parts = [select_part, f"FROM {first_table}", join_clause] + other_join_clauses
         if other_where:
             sql_parts.append(f"WHERE {other_where}{extra_where}")
         elif extra_where:
             sql_parts.append(f"WHERE 1=1{extra_where}")
 
-        if parse_result.order_by_columns:
+        if parse_result.group_by_raw:
+            sql_parts.append(f"GROUP BY {parse_result.group_by_raw}")
+        if parse_result.order_by_raw:
+            sql_parts.append(f"ORDER BY {parse_result.order_by_raw}")
+        elif parse_result.order_by_columns:
             order_clause = ", ".join(parse_result.order_by_columns)
             sql_parts.append(f"ORDER BY {order_clause}")
-        if parse_result.limit_value is not None:
+        if parse_result.limit_raw:
+            sql_parts.append(parse_result.limit_raw)
+        elif parse_result.limit_value is not None:
             sql_parts.append(f"LIMIT {parse_result.limit_value}")
 
         return " ".join(sql_parts)
 
-    def _build_exists_version(self, parse_result, col, subq_table, subq_where, subq_select_col, subq_alias, in_type):
+    def _build_exists_version(self, parse_result, col, subq_table, subq_where, subq_select_col, subq_alias, in_type,
+                              original_in_subq_alias=None):
         col_simple = col.split(".")[-1] if "." in col else col
-        main_table = parse_result.tables[0] if parse_result.tables else "main_table"
-        main_alias = [k for k, v in parse_result.table_aliases.items() if v == main_table]
-        main_prefix = f"{main_alias[0]}." if main_alias else ""
+        in_subq_table_alias = original_in_subq_alias or subq_alias
 
-        operator = "NOT EXISTS" if in_type == "NOT_IN" else "EXISTS"
-        subq_select_col_simple = subq_select_col.split(".")[-1]
-
-        select_part = self._rebuild_select(parse_result, main_prefix, None)
-
-        from_parts = []
+        main_tables_parts = []
         for tbl in parse_result.tables:
             alias = None
             for a, t in parse_result.table_aliases.items():
@@ -330,31 +360,68 @@ class InSubqueryToJoinRule(Rule):
                     alias = a
                     break
             if alias:
-                from_parts.append(f"{tbl} {alias}")
+                main_tables_parts.append(f"{tbl} {alias}")
             else:
-                from_parts.append(tbl)
-        from_clause = "FROM " + ", ".join(from_parts)
+                main_tables_parts.append(tbl)
 
-        other_where = self._extract_other_where_conditions(parse_result, col, in_type)
+        from_clause = "FROM " + " , ".join(main_tables_parts)
+        if len(parse_result.tables) > 1 and parse_result.join_conditions:
+            for i in range(1, len(parse_result.tables)):
+                join_idx = i - 1
+                jt = parse_result.join_types[join_idx] if join_idx < len(parse_result.join_types) else "INNER JOIN"
+                jc = parse_result.join_conditions[join_idx] if join_idx < len(parse_result.join_conditions) else "1=1"
+                if jt.upper() not in ("CROSS JOIN",):
+                    join_segment = f" {jt} {main_tables_parts[i]} ON {jc}"
+                else:
+                    join_segment = f" {jt} {main_tables_parts[i]}"
+                from_clause += join_segment
+
+        main_alias = None
+        if parse_result.table_aliases and parse_result.tables:
+            for a, t in parse_result.table_aliases.items():
+                if t == parse_result.tables[0]:
+                    main_alias = a
+                    break
+        main_prefix = f"{main_alias}." if main_alias else ""
+
+        operator = "NOT EXISTS" if in_type == "NOT_IN" else "EXISTS"
+        subq_select_col_simple = subq_select_col.split(".")[-1]
+
+        subq_where_adjusted = subq_where
+        if original_in_subq_alias and subq_where:
+            subq_where_adjusted = re.sub(
+                rf'\b{re.escape(original_in_subq_alias)}\.',
+                f"{in_subq_table_alias}.",
+                subq_where,
+            )
 
         exists_clause = (
             f"{operator} ("
-            f"SELECT 1 FROM {subq_table} {subq_alias} "
-            f"WHERE {subq_alias}.{subq_select_col_simple} = {main_prefix}{col_simple} "
-            f"AND {subq_where})"
+            f"SELECT 1 FROM {subq_table} {in_subq_table_alias} "
+            f"WHERE {in_subq_table_alias}.{subq_select_col_simple} = {main_prefix}{col_simple} "
+            f"AND {subq_where_adjusted})"
         )
 
+        other_where = self._extract_other_where_conditions(parse_result, col, in_type)
         where_parts = []
         if other_where:
             where_parts.append(other_where)
         where_parts.append(exists_clause)
         where_clause = "WHERE " + " AND ".join(where_parts)
 
+        select_part = self._rebuild_select(parse_result, main_prefix, None)
+
         sql_parts = [select_part, from_clause, where_clause]
-        if parse_result.order_by_columns:
+        if parse_result.group_by_raw:
+            sql_parts.append(f"GROUP BY {parse_result.group_by_raw}")
+        if parse_result.order_by_raw:
+            sql_parts.append(f"ORDER BY {parse_result.order_by_raw}")
+        elif parse_result.order_by_columns:
             order_clause = ", ".join(parse_result.order_by_columns)
             sql_parts.append(f"ORDER BY {order_clause}")
-        if parse_result.limit_value is not None:
+        if parse_result.limit_raw:
+            sql_parts.append(parse_result.limit_raw)
+        elif parse_result.limit_value is not None:
             sql_parts.append(f"LIMIT {parse_result.limit_value}")
 
         return " ".join(sql_parts)
@@ -919,18 +986,22 @@ class RuleEngine:
             "has_star": parse_result.has_star,
             "where_columns": parse_result.where_columns,
             "where_functions": parse_result.where_functions,
+            "where_clause": parse_result.where_clause,
             "subqueries_count": len(parse_result.subqueries),
             "in_subqueries": parse_result.in_subqueries,
             "join_types": parse_result.join_types,
             "join_conditions": parse_result.join_conditions,
             "order_by_columns": parse_result.order_by_columns,
+            "order_by_raw": parse_result.order_by_raw,
             "group_by_columns": parse_result.group_by_columns,
+            "group_by_raw": parse_result.group_by_raw,
             "having_columns": parse_result.having_columns,
             "having_clause": parse_result.having_clause,
             "has_having": parse_result.having_clause is not None,
             "has_group_by": len(parse_result.group_by_columns) > 0,
             "has_order_by": len(parse_result.order_by_columns) > 0,
             "limit_value": parse_result.limit_value,
+            "limit_raw": parse_result.limit_raw,
             "distinct": parse_result.distinct,
             "table_aliases": parse_result.table_aliases,
             "aggregate_functions": parse_result.aggregate_functions,

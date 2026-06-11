@@ -201,10 +201,11 @@ class ReportGenerator:
                     "subcategory": s.get("subcategory", ""),
                     "affected_sql_indices": [],
                     "affected_sql_summaries": [],
-                    "count": 0,
+                    "occurrences_per_sql": {},
+                    "occurrences": 0,
                     "details_samples": [],
                 }
-            issue_groups[rid]["count"] += 1
+            issue_groups[rid]["occurrences"] += 1
             if len(issue_groups[rid]["details_samples"]) < 2:
                 issue_groups[rid]["details_samples"].append({
                     "description": s.get("description", ""),
@@ -212,26 +213,41 @@ class ReportGenerator:
                 })
 
         for idx, r in enumerate(results):
-            seen_rids = set()
+            rid_counter = {}
             for s in r.get("suggestions", []):
                 rid = s.get("rule_id", "")
-                if rid in issue_groups and rid not in seen_rids:
-                    issue_groups[rid]["affected_sql_indices"].append(idx)
-                    sql_short = r["original_sql"].strip().replace("\n", " ")
-                    if len(sql_short) > 80:
-                        sql_short = sql_short[:77] + "..."
-                    issue_groups[rid]["affected_sql_summaries"].append(sql_short)
-                    seen_rids.add(rid)
+                if rid in issue_groups:
+                    rid_counter[rid] = rid_counter.get(rid, 0) + 1
+            for rid, count_in_sql in rid_counter.items():
+                issue_groups[rid]["affected_sql_indices"].append(idx)
+                issue_groups[rid]["occurrences_per_sql"][idx] = count_in_sql
+                sql_short = r["original_sql"].strip().replace("\n", " ")
+                if len(sql_short) > 80:
+                    sql_short = sql_short[:77] + "..."
+                suffix = f" [该类问题×{count_in_sql}]" if count_in_sql > 1 else ""
+                issue_groups[rid]["affected_sql_summaries"].append(
+                    f"{sql_short}{suffix}"
+                )
 
         severity_priority = {"high": 0, "medium": 1, "low": 2}
         sorted_groups = sorted(
             issue_groups.values(),
-            key=lambda g: (severity_priority.get(g["severity"], 3), -g["count"])
+            key=lambda g: (severity_priority.get(g["severity"], 3), -len(g["affected_sql_indices"]))
         )
 
         overview_items = []
         for g in sorted_groups:
-            impact = "全局" if g["count"] >= 3 else ("多查询" if g["count"] >= 2 else "单查询")
+            affected_count = len(g["affected_sql_indices"])
+            if affected_count >= 5:
+                impact = "全局范围"
+            elif affected_count >= 2:
+                impact = f"影响{affected_count}条SQL"
+            else:
+                impact = "影响1条SQL"
+
+            if g["occurrences"] > affected_count:
+                impact += f"（共{g['occurrences']}个问题点）"
+
             priority = "P0" if g["severity"] == "high" else ("P1" if g["severity"] == "medium" else "P2")
 
             item = {
@@ -242,8 +258,10 @@ class ReportGenerator:
                 "subcategory": g["subcategory"],
                 "priority": priority,
                 "impact_scope": impact,
-                "affected_queries": g["count"],
+                "affected_queries": affected_count,
+                "total_occurrences": g["occurrences"],
                 "affected_sql_summaries": g["affected_sql_summaries"],
+                "occurrences_per_sql": g["occurrences_per_sql"],
                 "samples": g["details_samples"],
             }
 

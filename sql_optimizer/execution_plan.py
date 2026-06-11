@@ -285,41 +285,59 @@ class ExecutionPlanGenerator:
                 extra_parts.append(f"聚合函数: {', '.join(parse_result.aggregate_functions)}")
 
             using_temporary = has_group or has_distinct
-            using_filesort = has_order and not self._order_by_uses_index(parse_result, schema_info)
+            using_filesort_g = has_order and not self._order_by_uses_index(parse_result, schema_info)
 
-            agg_extra = "Using temporary" if using_temporary else ""
-            if using_filesort:
-                agg_extra += "; Using filesort" if agg_extra else "Using filesort"
+            if schema_info:
+                temp_status = "Using temporary" if using_temporary else "无需临时表(可哈希分组)"
+                fs_status_g = "Using filesort(需额外排序)" if using_filesort_g else "Using index(无需filesort)"
+                g_explain = f"{temp_status}；{fs_status_g}"
+            else:
+                temp_status = "可能产生临时表(估算，需表结构确认)" if using_temporary else "无分组(估算)"
+                fs_status_g = "可能使用filesort(估算，需表结构确认)" if using_filesort_g else "估算可能不需要filesort"
+                g_explain = f"【估算】{temp_status}；{fs_status_g}"
+
+            agg_extra_parts = ["; ".join(extra_parts), g_explain]
 
             children.append(
                 PlanNode(
                     "AGGREGATE",
                     access_type="ALL",
-                    extra="; ".join(extra_parts),
+                    extra=" | ".join(agg_extra_parts),
                     rows=max(1, total_rows // 10),
                 )
             )
 
         if has_order:
             filesort = not self._order_by_uses_index(parse_result, schema_info)
+            if schema_info:
+                if filesort:
+                    sort_detail = "Using filesort — ORDER BY列未匹配索引顺序"
+                else:
+                    sort_detail = "Using index — 索引顺序消除排序"
+            else:
+                sort_detail = "【估算】可能产生filesort，需提供表结构确认"
             children.append(
                 PlanNode(
                     "SORT",
                     access_type="ALL",
                     extra=(
-                        f"ORDER BY: {', '.join(parse_result.order_by_columns)} "
-                        f"{'(Using filesort)' if filesort else '(Using index)'}"
+                        f"ORDER BY: {parse_result.order_by_raw or ', '.join(parse_result.order_by_columns)} "
+                        f"— {sort_detail}"
                     ),
                     rows=total_rows,
                 )
             )
 
         if has_distinct and not has_group:
+            if schema_info:
+                dist_detail = "Using temporary + Using filesort — DISTINCT需先排序去重"
+            else:
+                dist_detail = "【估算】可能产生临时表和filesort，需提供表结构确认"
             children.append(
                 PlanNode(
                     "DISTINCT",
                     access_type="ALL",
-                    extra="去重排序: Using temporary; Using filesort",
+                    extra=f"DISTINCT去重 — {dist_detail}",
                     rows=max(1, total_rows // 2),
                 )
             )

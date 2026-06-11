@@ -36,9 +36,12 @@ class SQLParseResult:
         self.where_clause = None
         self.having_clause = None
         self.order_by_columns = []
+        self.order_by_raw = None
         self.group_by_columns = []
+        self.group_by_raw = None
         self.having_columns = []
         self.limit_value = None
+        self.limit_raw = None
         self.distinct = False
         self.join_types = []
         self.table_aliases = {}
@@ -223,9 +226,9 @@ class SQLParser:
                     if func_match:
                         func_name = func_match.group(1).upper()
                         if func_name in self.known_functions:
-                            result.where_functions.append(func_name)
                             if func_name in ("SUM", "AVG", "COUNT", "MIN", "MAX", "GROUP_CONCAT"):
-                                result.aggregate_functions.append(func_name)
+                                if func_name not in result.aggregate_functions:
+                                    result.aggregate_functions.append(func_name)
                     return
 
                 if token.get_parent_name():
@@ -242,9 +245,9 @@ class SQLParser:
         if func_name:
             func_name_upper = func_name.upper()
             if func_name_upper in self.known_functions:
-                result.where_functions.append(func_name_upper)
                 if func_name_upper in ("SUM", "AVG", "COUNT", "MIN", "MAX", "GROUP_CONCAT"):
-                    result.aggregate_functions.append(func_name_upper)
+                    if func_name_upper not in result.aggregate_functions:
+                        result.aggregate_functions.append(func_name_upper)
 
     def _extract_where_and_having(self, stmt, result: SQLParseResult):
         for token in stmt.tokens:
@@ -437,16 +440,18 @@ class SQLParser:
 
     def _extract_order_group_limit(self, stmt, result: SQLParseResult):
         original_sql = stmt.value
-        upper_sql = original_sql.upper()
 
-        order_match = re.search(
-            r'\bORDER\s+BY\b(.+?)(?:LIMIT|HAVING|$)',
-            upper_sql,
+        order_full_match = re.search(
+            r'\bORDER\s+BY\b\s+(.+?)(?:\bLIMIT\b|\bHAVING\b|$)',
+            original_sql,
             re.DOTALL | re.IGNORECASE,
         )
-        if order_match:
-            order_text = order_match.group(1).strip()
-            order_items = [x.strip() for x in re.split(r',', order_text)]
+        if order_full_match:
+            order_full_text = order_full_match.group(1).strip()
+            result.order_by_raw = order_full_text
+
+            order_text = order_full_text.upper()
+            order_items = [x.strip() for x in re.split(r',', order_full_text)]
             for item in order_items:
                 clean = re.sub(r'\s+(ASC|DESC)\s*$', '', item, flags=re.IGNORECASE).strip()
                 clean = re.sub(r'[()]', '', clean)
@@ -455,14 +460,16 @@ class SQLParser:
                     if last_part and not last_part.upper() in self.known_functions:
                         result.order_by_columns.append(last_part.lower())
 
-        group_match = re.search(
-            r'\bGROUP\s+BY\b(.+?)(?:ORDER BY|HAVING|LIMIT|$)',
-            upper_sql,
+        group_full_match = re.search(
+            r'\bGROUP\s+BY\b\s+(.+?)(?:\bORDER BY\b|\bHAVING\b|\bLIMIT\b|$)',
+            original_sql,
             re.DOTALL | re.IGNORECASE,
         )
-        if group_match:
-            group_text = group_match.group(1).strip()
-            group_items = [x.strip() for x in re.split(r',', group_text)]
+        if group_full_match:
+            group_full_text = group_full_match.group(1).strip()
+            result.group_by_raw = group_full_text
+
+            group_items = [x.strip() for x in re.split(r',', group_full_text)]
             for item in group_items:
                 clean = re.sub(r'[()]', '', item).strip()
                 if clean and not clean.upper().startswith("CASE"):
@@ -470,10 +477,16 @@ class SQLParser:
                     if last_part and not last_part.upper() in self.known_functions:
                         result.group_by_columns.append(last_part.lower())
 
-        limit_match = re.search(r'\bLIMIT\s+(\d+)', upper_sql, re.IGNORECASE)
-        if limit_match:
+        limit_full_match = re.search(
+            r'\bLIMIT\s+(\d+)(?:\s*(?:,|OFFSET)\s*(\d+))?',
+            original_sql,
+            re.IGNORECASE,
+        )
+        if limit_full_match:
+            limit_tokens = limit_full_match.group(0).strip()
+            result.limit_raw = limit_tokens
             try:
-                result.limit_value = int(limit_match.group(1))
+                result.limit_value = int(limit_full_match.group(1))
             except ValueError:
                 pass
 
