@@ -127,13 +127,18 @@ class SQLParser:
             if token.ttype is Keyword and token.value.upper() == "FROM":
                 from_seen = True
                 continue
-            if token.ttype is Keyword and token.value.upper() in (
-                "JOIN", "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "STRAIGHT_JOIN", "NATURAL",
+
+            upper_val = token.value.upper().strip() if token.ttype is Keyword else ""
+            if upper_val in (
+                "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN",
+                "CROSS JOIN", "LEFT OUTER JOIN", "RIGHT OUTER JOIN",
+                "FULL OUTER JOIN", "STRAIGHT_JOIN", "NATURAL JOIN",
+                "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL",
             ):
                 join_seen = True
                 continue
 
-            if token.ttype is Keyword and token.value.upper() in (
+            if token.ttype is Keyword and upper_val in (
                 "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "UNION", "EXCEPT", "INTERSECT",
             ):
                 from_seen = False
@@ -156,8 +161,10 @@ class SQLParser:
                         result.tables.append(table_name)
                         if alias:
                             result.table_aliases[alias] = table_name
-                    from_seen = False
-                    join_seen = False
+                    if join_seen:
+                        join_seen = False
+                    else:
+                        from_seen = False
 
     def _parse_table_identifier(self, identifier):
         table_name = None
@@ -509,44 +516,42 @@ class SQLParser:
                 if jk not in result.join_types:
                     result.join_types.append(jk)
 
-        sql = stmt.value
-        pattern = r'\bON\s+([^A-Z]+?)(?:\bWHERE\b|\bGROUP\b|\bORDER\b|\bLIMIT\b|\bHAVING\b|\bJOIN\b|\bINNER\b|\bLEFT\b|\bRIGHT\b|\bCROSS\b|$)'
-        matches = re.finditer(pattern, sql, re.IGNORECASE | re.DOTALL)
-        for m in matches:
-            cond = m.group(1).strip()
-            cond = re.sub(r'\s+', ' ', cond)
-            if cond:
-                paren_count = cond.count("(") - cond.count(")")
-                if paren_count > 0:
-                    for _ in range(paren_count):
-                        if cond.endswith("("):
-                            cond = cond[:-1]
-                result.join_conditions.append(cond.strip())
-
-        if not result.join_conditions:
-            on_seen = False
-            current_cond = []
-            for token in stmt.tokens:
-                if token.ttype is Keyword and token.value.upper() == "ON":
-                    on_seen = True
+        on_seen = False
+        current_cond = []
+        for token in stmt.tokens:
+            if token.is_whitespace:
+                if on_seen:
+                    current_cond.append(token)
+                continue
+            if token.ttype is Keyword and token.value.upper() == "ON":
+                on_seen = True
+                current_cond = []
+                continue
+            if on_seen:
+                stop = False
+                if token.ttype is Keyword and token.value.upper() in (
+                    "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING",
+                    "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN",
+                    "FULL JOIN", "CROSS JOIN", "INNER", "LEFT", "RIGHT",
+                    "CROSS", "FULL",
+                ):
+                    stop = True
+                if isinstance(token, Where):
+                    stop = True
+                if stop:
+                    cond = "".join([str(t) for t in current_cond]).strip()
+                    cond = re.sub(r'\s+', ' ', cond)
+                    if cond:
+                        result.join_conditions.append(cond)
+                    on_seen = False
                     current_cond = []
                     continue
-                if on_seen:
-                    if token.ttype is Keyword and token.value.upper() in (
-                        "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "JOIN",
-                        "INNER", "LEFT", "RIGHT", "CROSS", "FULL",
-                    ):
-                        cond = "".join([str(t) for t in current_cond]).strip()
-                        if cond:
-                            result.join_conditions.append(cond)
-                        on_seen = False
-                        current_cond = []
-                        continue
-                    current_cond.append(token)
-            if current_cond:
-                cond = "".join([str(t) for t in current_cond]).strip()
-                if cond:
-                    result.join_conditions.append(cond)
+                current_cond.append(token)
+        if current_cond:
+            cond = "".join([str(t) for t in current_cond]).strip()
+            cond = re.sub(r'\s+', ' ', cond)
+            if cond:
+                result.join_conditions.append(cond)
 
     def _extract_aggregates(self, stmt, result: SQLParseResult):
         sql = stmt.value

@@ -285,14 +285,35 @@ class ExecutionPlanGenerator:
                 extra_parts.append(f"聚合函数: {', '.join(parse_result.aggregate_functions)}")
 
             using_temporary = has_group or has_distinct
-            using_filesort_g = has_order and not self._order_by_uses_index(parse_result, schema_info)
+            group_uses_idx = self._group_by_uses_index(parse_result, schema_info)
+            order_uses_idx = self._order_by_uses_index(parse_result, schema_info) if has_order else False
+
+            if has_group and has_order:
+                using_filesort_g = not (group_uses_idx and order_uses_idx)
+            elif has_group:
+                using_filesort_g = not group_uses_idx
+            else:
+                using_filesort_g = has_order and not order_uses_idx
 
             if schema_info:
-                temp_status = "Using temporary" if using_temporary else "无需临时表(可哈希分组)"
-                fs_status_g = "Using filesort(需额外排序)" if using_filesort_g else "Using index(无需filesort)"
+                if using_temporary:
+                    temp_status = "Using temporary"
+                else:
+                    temp_status = "无需临时表(可哈希分组)"
+                if has_group:
+                    if group_uses_idx:
+                        temp_status += "(GROUP BY列匹配索引，可利用索引分组)"
+                    else:
+                        temp_status += "(GROUP BY列无可用索引，需临时表分组)"
+                if using_filesort_g:
+                    fs_status_g = "Using filesort(需额外排序)"
+                else:
+                    fs_status_g = "Using index(无需filesort)"
                 g_explain = f"{temp_status}；{fs_status_g}"
             else:
                 temp_status = "可能产生临时表(估算，需表结构确认)" if using_temporary else "无分组(估算)"
+                if has_group:
+                    temp_status += "(GROUP BY列索引情况未知)"
                 fs_status_g = "可能使用filesort(估算，需表结构确认)" if using_filesort_g else "估算可能不需要filesort"
                 g_explain = f"【估算】{temp_status}；{fs_status_g}"
 
@@ -578,6 +599,27 @@ class ExecutionPlanGenerator:
                     match = all(
                         order_cols[i] == idx_cols[i]
                         for i in range(len(order_cols))
+                    )
+                    if match:
+                        return True
+        return False
+
+    def _group_by_uses_index(self, parse_result, schema_info):
+        if not schema_info or not parse_result.group_by_columns:
+            return False
+
+        group_cols = [c.split(".")[-1] for c in parse_result.group_by_columns]
+        main_table = parse_result.tables[0] if parse_result.tables else None
+
+        for tbl in schema_info.get("tables", []):
+            if main_table and tbl.get("name") != main_table:
+                continue
+            for idx in tbl.get("indexes", []):
+                idx_cols = idx.get("columns", [])
+                if len(idx_cols) >= len(group_cols):
+                    match = all(
+                        group_cols[i] == idx_cols[i]
+                        for i in range(len(group_cols))
                     )
                     if match:
                         return True

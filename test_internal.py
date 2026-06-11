@@ -348,6 +348,140 @@ def test_regression_basic():
 
 run_test("回归测试 - 基础功能", test_regression_basic)
 
+# ---- 11. 多表JOIN + IN子查询改写保留完整JOIN链 ----
+
+def test_multi_join_in_subquery_rewrite():
+    sql = """SELECT o.order_id, o.total, c.name
+FROM orders o
+INNER JOIN customers c ON o.customer_id = c.id
+WHERE o.status = 'active' AND o.customer_id IN (
+    SELECT cu.customer_id FROM customers cu WHERE cu.country = 'USA'
+)
+ORDER BY o.order_date DESC, o.total ASC
+LIMIT 20 OFFSET 0"""
+    result = engine.analyze(sql)
+    suggestions = result["suggestions"]
+    r003 = [s for s in suggestions if s["rule_id"] == "R003"]
+    assert len(r003) >= 1, "多表JOIN+IN子查询应触发R003"
+
+    details = r003[0].get("details", {})
+    rewrite_options = details.get("rewrite_options", [])
+
+    join_opt = [o for o in rewrite_options if o["type"] == "JOIN改写"]
+    exists_opt = [o for o in rewrite_options if o["type"] == "EXISTS改写"]
+    assert len(join_opt) >= 1, "应有JOIN改写方案"
+    assert len(exists_opt) >= 1, "应有EXISTS改写方案"
+
+    join_sql = join_opt[0]["sql"]
+    assert "INNER JOIN customers c ON" in join_sql, f"JOIN版应保留原INNER JOIN customers c: {join_sql}"
+    assert "customers_subq" in join_sql, f"JOIN版应有子查询派生表别名customers_subq: {join_sql}"
+    assert "ORDER BY o.order_date DESC" in join_sql, f"JOIN版应保留ORDER BY方向: {join_sql}"
+    assert "LIMIT 20 OFFSET 0" in join_sql, f"JOIN版应保留完整LIMIT OFFSET: {join_sql}"
+    assert "status" in join_sql, f"JOIN版应保留其他WHERE条件: {join_sql}"
+
+    exists_sql = exists_opt[0]["sql"]
+    assert "INNER JOIN customers c ON" in exists_sql, f"EXISTS版应保留原INNER JOIN: {exists_sql}"
+    assert "EXISTS" in exists_sql, f"EXISTS版应有EXISTS关键字: {exists_sql}"
+
+    import re
+    alias_defs = re.findall(r'(?:JOIN|FROM)\s+(?:\(\s*SELECT[^)]*\)\s+\w+|\w+)\s+(\w+)', exists_sql)
+    assert len(alias_defs) == len(set(alias_defs)), f"EXISTS版别名不应重复: {alias_defs}"
+    assert "ORDER BY o.order_date DESC" in exists_sql, f"EXISTS版应保留ORDER BY方向: {exists_sql}"
+
+    print(f"    JOIN版: {join_sql[:120]}...")
+    print(f"    EXISTS版: {exists_sql[:120]}...")
+
+run_test("多表JOIN+IN子查询改写保留完整JOIN链", test_multi_join_in_subquery_rewrite)
+
+# ---- 12. 同SQL多个WHERE函数 - overview去重但展示问题点数 ----
+
+def test_overview_multiple_same_type_per_sql():
+    sql = "SELECT * FROM users WHERE UPPER(name) = 'A' AND LOWER(email) = 'b'"
+    result = engine.analyze(sql)
+
+    pr = result["parse_result"]
+    where_funcs = pr["where_functions"]
+    func_names = [f.get("function", "") for f in where_funcs]
+    assert "UPPER" in func_names, f"UPPER应在WHERE函数列表: {func_names}"
+    assert "LOWER" in func_names, f"LOWER应在WHERE函数列表: {func_names}"
+
+    report = report_gen.generate([sql])
+    overview = report.get("overview", [])
+    r002_items = [o for o in overview if o["rule_id"] == "R002"]
+    assert len(r002_items) >= 1, "overview应有R002条目"
+
+    r002 = r002_items[0]
+    assert r002_items[0]["affected_queries"] == 1, f"同类问题同SQL只应计1条受影响查询: {r002['affected_queries']}"
+    assert r002_items[0]["total_occurrences"] >= 2, f"应有至少2个问题点: {r002['total_occurrences']}"
+
+    summaries = r002.get("affected_sql_summaries", [])
+    has_multi_marker = any("×2" in s or "×3" in s for s in summaries)
+    assert has_multi_marker, f"样例应展示多个同类点标记: {summaries}"
+
+    print(f"    affected_queries: {r002['affected_queries']}, total_occurrences: {r002['total_occurrences']}")
+    for s in summaries:
+        print(f"    - {s}")
+
+run_test("同SQL多个WHERE函数-overview去重展示", test_overview_multiple_same_type_per_sql)
+
+# ---- 13. GROUP BY有索引时执行计划标注索引消除 ----
+
+def test_group_by_with_index():
+    sql = "SELECT status, COUNT(*) FROM orders GROUP BY status"
+    schema_ddl = """
+    CREATE TABLE orders (
+        order_id INT PRIMARY KEY,
+        status VARCHAR(20),
+        total DECIMAL(10,2),
+        INDEX idx_status (status)
+    )
+    """
+    schema = schema_parser.parse(schema_ddl)
+    plan = plan_gen.generate(sql, schema)
+
+    steps = plan["steps"]
+    agg_steps = [s for s in steps if s.get("node_type") == "AGGREGATE"]
+    assert len(agg_steps) >= 1, "应有AGGREGATE步骤"
+
+    agg = agg_steps[0]
+    extra = agg.get("extra", "")
+    assert "GROUP BY列匹配索引" in extra or "Using index" in extra, \
+        f"GROUP BY有索引时应说明匹配索引: {extra}"
+    assert "filesort" not in extra.lower() or "无需filesort" in extra, \
+        f"GROUP BY有索引时不应有filesort或应标注无需: {extra}"
+    print(f"    AGGREGATE extra: {extra}")
+
+run_test("GROUP BY有索引-执行计划标注索引消除", test_group_by_with_index)
+
+# ---- 14. GROUP BY无索引时执行计划明确需临时表和filesort ----
+
+def test_group_by_without_index():
+    sql = "SELECT customer_id, COUNT(*) FROM orders GROUP BY customer_id"
+    schema_ddl = """
+    CREATE TABLE orders (
+        order_id INT PRIMARY KEY,
+        customer_id INT,
+        status VARCHAR(20),
+        total DECIMAL(10,2),
+        INDEX idx_status (status)
+    )
+    """
+    schema = schema_parser.parse(schema_ddl)
+    plan = plan_gen.generate(sql, schema)
+
+    steps = plan["steps"]
+    agg_steps = [s for s in steps if s.get("node_type") == "AGGREGATE"]
+    assert len(agg_steps) >= 1, "应有AGGREGATE步骤"
+
+    agg = agg_steps[0]
+    extra = agg.get("extra", "")
+    assert "Using temporary" in extra, f"GROUP BY无索引时应有Using temporary: {extra}"
+    assert "GROUP BY列无可用索引" in extra, f"应说明GROUP BY列无索引: {extra}"
+    assert "Using filesort" in extra, f"GROUP BY无索引时应有Using filesort: {extra}"
+    print(f"    AGGREGATE extra: {extra}")
+
+run_test("GROUP BY无索引-明确临时表和filesort", test_group_by_without_index)
+
 # 总结
 print("\n" + "=" * 80)
 print(f"  测试总结: 通过 {passed} / {passed + failed}")

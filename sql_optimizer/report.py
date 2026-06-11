@@ -186,6 +186,14 @@ class ReportGenerator:
         else:
             return {"grade": "E", "label": "严重", "color": "#dc3545"}
 
+    def _count_issue_points(self, suggestion):
+        details = suggestion.get("details", {})
+        if "functions" in details and isinstance(details["functions"], list):
+            return len(details["functions"])
+        if "affected_columns" in details and isinstance(details["affected_columns"], list):
+            return len(details["affected_columns"])
+        return 1
+
     def _build_diagnostic_overview(self, all_suggestions_flat, results):
         issue_groups = {}
         for s in all_suggestions_flat:
@@ -205,7 +213,7 @@ class ReportGenerator:
                     "occurrences": 0,
                     "details_samples": [],
                 }
-            issue_groups[rid]["occurrences"] += 1
+            issue_groups[rid]["occurrences"] += self._count_issue_points(s)
             if len(issue_groups[rid]["details_samples"]) < 2:
                 issue_groups[rid]["details_samples"].append({
                     "description": s.get("description", ""),
@@ -217,7 +225,7 @@ class ReportGenerator:
             for s in r.get("suggestions", []):
                 rid = s.get("rule_id", "")
                 if rid in issue_groups:
-                    rid_counter[rid] = rid_counter.get(rid, 0) + 1
+                    rid_counter[rid] = rid_counter.get(rid, 0) + self._count_issue_points(s)
             for rid, count_in_sql in rid_counter.items():
                 issue_groups[rid]["affected_sql_indices"].append(idx)
                 issue_groups[rid]["occurrences_per_sql"][idx] = count_in_sql

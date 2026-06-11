@@ -364,17 +364,17 @@ class InSubqueryToJoinRule(Rule):
             else:
                 main_tables_parts.append(tbl)
 
-        from_clause = "FROM " + " , ".join(main_tables_parts)
+        first_table = main_tables_parts[0] if main_tables_parts else "main_table"
+        from_clause = f"FROM {first_table}"
         if len(parse_result.tables) > 1 and parse_result.join_conditions:
             for i in range(1, len(parse_result.tables)):
                 join_idx = i - 1
                 jt = parse_result.join_types[join_idx] if join_idx < len(parse_result.join_types) else "INNER JOIN"
                 jc = parse_result.join_conditions[join_idx] if join_idx < len(parse_result.join_conditions) else "1=1"
                 if jt.upper() not in ("CROSS JOIN",):
-                    join_segment = f" {jt} {main_tables_parts[i]} ON {jc}"
+                    from_clause += f" {jt} {main_tables_parts[i]} ON {jc}"
                 else:
-                    join_segment = f" {jt} {main_tables_parts[i]}"
-                from_clause += join_segment
+                    from_clause += f" {jt} {main_tables_parts[i]}"
 
         main_alias = None
         if parse_result.table_aliases and parse_result.tables:
