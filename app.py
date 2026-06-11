@@ -217,6 +217,8 @@ def list_rules():
          "description": "NOT IN 性能不如 LEFT JOIN 或 NOT EXISTS"},
         {"rule_id": "R012", "name": "避免隐式类型转换", "severity": "medium",
          "description": "隐式类型转换会导致索引失效"},
+        {"rule_id": "R013", "name": "HAVING建议移至WHERE或添加GROUP BY", "severity": "high",
+         "description": "使用HAVING而无GROUP BY可能是误用，过滤条件应尽可能放在WHERE中"},
     ]
     return jsonify({"rules": rules, "total": len(rules)})
 

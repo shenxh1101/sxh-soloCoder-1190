@@ -1,4 +1,5 @@
 import re
+import difflib
 
 
 class SQLHighlighter:
@@ -81,17 +82,24 @@ class SQLHighlighter:
 
         diff_details = self._compute_diff(original_sql, optimized_sql)
 
+        annotated_original, annotated_optimized = self._annotate_diff(
+            original_sql, optimized_sql
+        )
+
         return {
             "original": {
                 "sql": original_sql,
                 "highlighted": original_highlighted,
+                "annotated": annotated_original,
             },
             "optimized": {
                 "sql": optimized_sql,
                 "highlighted": optimized_highlighted,
+                "annotated": annotated_optimized,
             },
             "has_changes": original_sql.strip() != optimized_sql.strip(),
             "diff_details": diff_details,
+            "diff_summary": self._build_diff_summary(diff_details),
             "css": self._get_css(),
         }
 
@@ -198,6 +206,55 @@ class SQLHighlighter:
 
         return tokens
 
+    def _annotate_diff(self, original, optimized):
+        orig_words = self._tokenize_for_diff(original)
+        opt_words = self._tokenize_for_diff(optimized)
+
+        sm = difflib.SequenceMatcher(None, orig_words, opt_words)
+
+        annotated_original = []
+        annotated_optimized = []
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for w in orig_words[i1:i2]:
+                    annotated_original.append(self._token_for_display(w))
+                for w in opt_words[j1:j2]:
+                    annotated_optimized.append(self._token_for_display(w))
+            elif tag == "replace":
+                for w in orig_words[i1:i2]:
+                    annotated_original.append(
+                        f'<span class="sql-diff-removed">{self._token_for_display(w)}</span>'
+                    )
+                for w in opt_words[j1:j2]:
+                    annotated_optimized.append(
+                        f'<span class="sql-diff-added">{self._token_for_display(w)}</span>'
+                    )
+            elif tag == "delete":
+                for w in orig_words[i1:i2]:
+                    annotated_original.append(
+                        f'<span class="sql-diff-removed">{self._token_for_display(w)}</span>'
+                    )
+            elif tag == "insert":
+                for w in opt_words[j1:j2]:
+                    annotated_optimized.append(
+                        f'<span class="sql-diff-added">{self._token_for_display(w)}</span>'
+                    )
+
+        return "".join(annotated_original), "".join(annotated_optimized)
+
+    def _tokenize_for_diff(self, sql):
+        tokens = []
+        for token_type, value in self._tokenize(sql):
+            if token_type == "whitespace":
+                tokens.append(" ")
+            else:
+                tokens.append(value)
+        return tokens
+
+    def _token_for_display(self, token):
+        return self._html_escape(token)
+
     def _compute_diff(self, original, optimized):
         orig_words = original.split()
         opt_words = optimized.split()
@@ -215,6 +272,24 @@ class SQLHighlighter:
             details.append({"type": "removed", "word": word})
 
         return details
+
+    def _build_diff_summary(self, diff_details):
+        added = [d["word"] for d in diff_details if d["type"] == "added"]
+        removed = [d["word"] for d in diff_details if d["type"] == "removed"]
+
+        changes = []
+        if added:
+            changes.append(f"新增: {', '.join(added)}")
+        if removed:
+            changes.append(f"删除: {', '.join(removed)}")
+
+        return {
+            "added": added,
+            "removed": removed,
+            "added_count": len(added),
+            "removed_count": len(removed),
+            "changes": changes,
+        }
 
     def _html_escape(self, text):
         return (
@@ -234,6 +309,20 @@ class SQLHighlighter:
 .sql-operator { color: #333333; font-weight: bold; }
 .sql-parenthesis { color: #666666; }
 .sql-comma { color: #666666; }
-.sql-diff-added { background-color: #ddffdd; }
-.sql-diff-removed { background-color: #ffdddd; text-decoration: line-through; }
+.sql-diff-added {
+  background-color: #e6ffed;
+  border: 1px solid #34d058;
+  border-radius: 3px;
+  padding: 0 2px;
+  margin: 0 1px;
+}
+.sql-diff-removed {
+  background-color: #ffeef0;
+  border: 1px solid #d73a49;
+  border-radius: 3px;
+  padding: 0 2px;
+  margin: 0 1px;
+  text-decoration: line-through;
+  opacity: 0.7;
+}
 """
